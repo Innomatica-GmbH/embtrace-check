@@ -1,0 +1,984 @@
+"""Dependency scanner — detects dependencies from lockfiles and manifests.
+
+Supports:
+- conan.lock / conanfile.txt  (C/C++ via Conan)
+- requirements.txt            (Python pip)
+- pyproject.toml              (Python — PEP 621/735 + Poetry; skipped when poetry.lock exists)
+- poetry.lock                 (Python Poetry)
+- Pipfile.lock                (Python Pipenv)
+- vcpkg.json                  (C/C++ vcpkg)
+- CMakeLists.txt              (CMake FetchContent/find_package, best-effort)
+- Cargo.lock                  (Rust Cargo)
+- package-lock.json           (npm)
+- yarn.lock                   (Yarn Classic)
+- pnpm-lock.yaml              (pnpm)
+- gradle.lockfile             (Gradle)
+- pom.xml                     (Maven)
+- go.sum                      (Go Modules)
+- alire.lock                  (Ada/SPARK Alire)
+- embtrace-deps.yaml          (manual declaration for proprietary libs)
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import tomllib
+import xml.etree.ElementTree as ET
+from typing import TYPE_CHECKING
+from urllib.parse import quote
+
+import yaml
+from pydantic import BaseModel
+
+from embtrace_check.core.log import get_logger
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+logger = get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Dependency model
+# ---------------------------------------------------------------------------
+
+class Dependency(BaseModel):
+    """A single software dependency detected by scanning.
+
+    Base fields cover CycloneDX / SPDX identity. The trailing block of fields
+    carry BSI TR-03183-2 v2.1.0 specific metadata and stay ``None`` when no
+    scanner / enricher has populated them yet — this keeps every existing
+    scanner backward compatible.
+    """
+
+    name: str
+    version: str
+    ecosystem: str  # conan, pypi, cmake, vcpkg, manual
+    license: str | None = None
+    supplier: str | None = None
+    purl: str | None = None
+    cpe: str | None = None
+    description: str | None = None
+
+    # ------------------------------------------------------------------
+    # BSI TR-03183-2 v2.1.0 metadata (all optional, populated on demand)
+    # ------------------------------------------------------------------
+    # Hash of the deployable component. BSI mandates SHA-512 explicitly;
+    # we accept the raw hex digest here.
+    hash_sha512: str | None = None
+    # Hash of the source form, when distinct from the deployable (optional per TR).
+    hash_source_sha512: str | None = None
+    # Filename of the component artefact on disk (required per TR §5).
+    filename: str | None = None
+    # Component creator, either an RFC 5322 email or a URL (required per TR §5).
+    creator: str | None = None
+    # Classification properties (required per TR §5; default to ``None`` = unknown).
+    is_executable: bool | None = None
+    is_archive: bool | None = None
+    is_structured: bool | None = None
+    # Source code URI (optional per TR §5).
+    source_uri: str | None = None
+    # URI of deployable form (optional per TR §5).
+    deployable_uri: str | None = None
+    # URL of security.txt (RFC 9116) (optional per TR §5).
+    security_txt_url: str | None = None
+    # Effective licence distinct from declared licences (optional per TR §5).
+    effective_license: str | None = None
+    # List of component names this component DEPENDS_ON (for BSI-relationship).
+    dependencies: list[str] | None = None
+
+
+def _make_purl(ecosystem: str, name: str, version: str) -> str:
+    """Build a Package URL string."""
+    type_map = {
+        "conan": "conan",
+        "pypi": "pypi",
+        "vcpkg": "vcpkg",
+        "cmake": "generic",
+        "meson": "generic",
+        "autotools": "generic",
+        "configure": "generic",
+        "make": "generic",
+        "manual": "generic",
+        "cargo": "cargo",
+        "npm": "npm",
+        "golang": "golang",
+        "maven": "maven",
+        "gradle": "maven",
+        "alire": "alire",
+    }
+    purl_type = type_map.get(ecosystem, "generic")
+
+    if ecosystem == "pypi":
+        # PURL names are lowercase for pypi
+        purl_name = name.lower().replace("_", "-")
+    elif ecosystem == "npm":
+        # Scoped packages: @scope/name → %40scope/name
+        purl_name = quote(name, safe="/")
+    elif ecosystem == "golang":
+        # Go module paths: URL-encode slashes
+        purl_name = quote(name, safe="")
+    elif ecosystem in ("maven", "gradle"):
+        # Maven: group/artifact (name should already contain the slash)
+        purl_name = name
+    else:
+        purl_name = name
+
+    return f"pkg:{purl_type}/{purl_name}@{version}"
+
+
+# ---------------------------------------------------------------------------
+# Individual scanners
+# ---------------------------------------------------------------------------
+
+def scan_conan_lock(path: Path) -> list[Dependency]:
+    """Parse a Conan 2.x conan.lock (JSON) file."""
+    deps: list[Dependency] = []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning("Failed to parse %s: %s", path, exc)
+        return deps
+
+    # Conan 2.x lock format: {"requires": ["zlib/1.3.1#hash", ...]}
+    for ref in data.get("requires", []):
+        # Format: name/version#revision or name/version
+        clean = ref.split("#")[0]
+        parts = clean.split("/", 1)
+        if len(parts) == 2:
+            name, version = parts
+            deps.append(Dependency(
+                name=name,
+                version=version,
+                ecosystem="conan",
+                purl=_make_purl("conan", name, version),
+            ))
+
+    # Also handle build_requires
+    for ref in data.get("build_requires", []):
+        clean = ref.split("#")[0]
+        parts = clean.split("/", 1)
+        if len(parts) == 2:
+            name, version = parts
+            deps.append(Dependency(
+                name=name,
+                version=version,
+                ecosystem="conan",
+                purl=_make_purl("conan", name, version),
+            ))
+
+    logger.info("Found %d dependencies in %s", len(deps), path)
+    return deps
+
+
+def scan_conanfile_txt(path: Path) -> list[Dependency]:
+    """Parse a conanfile.txt [requires] section."""
+    deps: list[Dependency] = []
+    in_requires = False
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        logger.warning("Failed to read %s: %s", path, exc)
+        return deps
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("["):
+            in_requires = stripped.lower() in ("[requires]", "[build_requires]")
+            continue
+        if in_requires and "/" in stripped and not stripped.startswith("#"):
+            parts = stripped.split("/", 1)
+            if len(parts) == 2:
+                name = parts[0]
+                version = parts[1].split("@")[0].split("#")[0].strip()
+                deps.append(Dependency(
+                    name=name,
+                    version=version,
+                    ecosystem="conan",
+                    purl=_make_purl("conan", name, version),
+                ))
+
+    logger.info("Found %d dependencies in %s", len(deps), path)
+    return deps
+
+
+def scan_requirements_txt(path: Path) -> list[Dependency]:
+    """Parse a pip requirements.txt file."""
+    deps: list[Dependency] = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        logger.warning("Failed to read %s: %s", path, exc)
+        return deps
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or stripped.startswith("-"):
+            continue
+        # Match: package==version or package>=version etc.
+        match = re.match(r"^([a-zA-Z0-9_.-]+)\s*[=~!<>]=*\s*([a-zA-Z0-9._*-]+)", stripped)
+        if match:
+            name, version = match.group(1), match.group(2)
+            deps.append(Dependency(
+                name=name,
+                version=version,
+                ecosystem="pypi",
+                purl=_make_purl("pypi", name, version),
+            ))
+
+    logger.info("Found %d dependencies in %s", len(deps), path)
+    return deps
+
+
+# Matches a PEP 508 requirement with a version constraint:
+# "click>=8.1", "uvicorn[standard]==0.23", "pydantic >= 2.0, <3" …
+_PYPROJECT_REQ_RE = re.compile(
+    r"^([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]*\])?\s*[=~!<>]=*\s*([A-Za-z0-9._*-]+)"
+)
+
+
+def _poetry_spec_version(spec: object) -> str:
+    """Extract a concrete version from a Poetry dependency specifier.
+
+    Handles plain strings (``"^8.1"``, ``">=1.0,<2"``) and tables with a
+    ``version`` key. Git / path / URL specifiers yield ``""``.
+    """
+    if isinstance(spec, dict):
+        spec = spec.get("version", "")
+    if not isinstance(spec, str):
+        return ""
+    match = re.match(r"[\^~=<>!\s]*([0-9][A-Za-z0-9._*-]*)", spec)
+    return match.group(1) if match else ""
+
+
+def scan_pyproject_toml(path: Path) -> list[Dependency]:
+    """Parse a pyproject.toml (PEP 621, PEP 735 dependency-groups, Poetry).
+
+    Skipped entirely when a ``poetry.lock`` sits next to it — the lockfile
+    carries exact versions for the same dependency set and wins. Requirement
+    entries without any version constraint are skipped (no concrete version
+    to put into an SBOM).
+    """
+    deps: list[Dependency] = []
+    if path.with_name("poetry.lock").is_file():
+        logger.info("Skipping %s — poetry.lock present", path)
+        return deps
+
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (tomllib.TOMLDecodeError, OSError) as exc:
+        logger.warning("Failed to parse %s: %s", path, exc)
+        return deps
+
+    def _add(name: str, version: str) -> None:
+        if name and version and version != "*":
+            deps.append(Dependency(
+                name=name,
+                version=version,
+                ecosystem="pypi",
+                purl=_make_purl("pypi", name, version),
+            ))
+
+    # PEP 621 [project.dependencies] / [project.optional-dependencies]
+    # and PEP 735 [dependency-groups]
+    project = data.get("project", {})
+    req_lists: list[object] = [project.get("dependencies", [])]
+    req_lists.extend(project.get("optional-dependencies", {}).values())
+    req_lists.extend(data.get("dependency-groups", {}).values())
+    for req_list in req_lists:
+        if not isinstance(req_list, list):
+            continue
+        for req in req_list:
+            if not isinstance(req, str):
+                continue  # PEP 735 include-group tables
+            match = _PYPROJECT_REQ_RE.match(req.strip())
+            if match:
+                _add(match.group(1), match.group(2))
+
+    # Poetry: [tool.poetry.dependencies] / dev-dependencies / group.*.dependencies
+    poetry = data.get("tool", {}).get("poetry", {})
+    poetry_tables: list[object] = [
+        poetry.get("dependencies", {}),
+        poetry.get("dev-dependencies", {}),
+    ]
+    poetry_tables.extend(
+        group.get("dependencies", {})
+        for group in poetry.get("group", {}).values()
+        if isinstance(group, dict)
+    )
+    for table in poetry_tables:
+        if not isinstance(table, dict):
+            continue
+        for name, spec in table.items():
+            if name == "python":
+                continue
+            _add(name, _poetry_spec_version(spec))
+
+    logger.info("Found %d dependencies in %s", len(deps), path)
+    return deps
+
+
+def scan_poetry_lock(path: Path) -> list[Dependency]:
+    """Parse a Poetry poetry.lock (TOML) file."""
+    deps: list[Dependency] = []
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (tomllib.TOMLDecodeError, OSError) as exc:
+        logger.warning("Failed to parse %s: %s", path, exc)
+        return deps
+
+    for pkg in data.get("package", []):
+        name = pkg.get("name", "")
+        version = pkg.get("version", "")
+        if name and version:
+            deps.append(Dependency(
+                name=name,
+                version=version,
+                ecosystem="pypi",
+                purl=_make_purl("pypi", name, version),
+                description=pkg.get("description"),
+            ))
+
+    logger.info("Found %d dependencies in %s", len(deps), path)
+    return deps
+
+
+def scan_pipfile_lock(path: Path) -> list[Dependency]:
+    """Parse a Pipenv Pipfile.lock (JSON) file."""
+    deps: list[Dependency] = []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning("Failed to parse %s: %s", path, exc)
+        return deps
+
+    for section in ("default", "develop"):
+        for name, info in data.get(section, {}).items():
+            version = info.get("version", "").lstrip("=")
+            if name and version:
+                deps.append(Dependency(
+                    name=name,
+                    version=version,
+                    ecosystem="pypi",
+                    purl=_make_purl("pypi", name, version),
+                ))
+
+    logger.info("Found %d dependencies in %s", len(deps), path)
+    return deps
+
+
+def scan_vcpkg_json(path: Path) -> list[Dependency]:
+    """Parse a vcpkg.json manifest."""
+    deps: list[Dependency] = []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning("Failed to parse %s: %s", path, exc)
+        return deps
+
+    for entry in data.get("dependencies", []):
+        if isinstance(entry, str):
+            deps.append(Dependency(
+                name=entry,
+                version="*",
+                ecosystem="vcpkg",
+                purl=_make_purl("vcpkg", entry, "*"),
+            ))
+        elif isinstance(entry, dict):
+            name = entry.get("name", "")
+            version = entry.get("version>=", entry.get("version", "*"))
+            if name:
+                deps.append(Dependency(
+                    name=name,
+                    version=str(version),
+                    ecosystem="vcpkg",
+                    purl=_make_purl("vcpkg", name, str(version)),
+                ))
+
+    logger.info("Found %d dependencies in %s", len(deps), path)
+    return deps
+
+
+_CMAKE_FETCH_CONTENT = re.compile(
+    r"FetchContent_Declare\s*\(\s*(\w+).*?GIT_TAG\s+([v]?[\w._-]+)",
+    re.DOTALL | re.IGNORECASE,
+)
+_CMAKE_FIND_PACKAGE = re.compile(
+    r"find_package\s*\(\s*(\w+)(?:\s+(\d[\w._-]*))?",
+    re.IGNORECASE,
+)
+
+
+def scan_cmake(path: Path) -> list[Dependency]:
+    """Best-effort scan of CMakeLists.txt for FetchContent and find_package."""
+    deps: list[Dependency] = []
+    try:
+        content = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Failed to read %s: %s", path, exc)
+        return deps
+
+    for match in _CMAKE_FETCH_CONTENT.finditer(content):
+        name, version = match.group(1), match.group(2)
+        deps.append(Dependency(
+            name=name,
+            version=version,
+            ecosystem="cmake",
+            purl=_make_purl("cmake", name, version),
+        ))
+
+    for match in _CMAKE_FIND_PACKAGE.finditer(content):
+        name = match.group(1)
+        version = match.group(2) or "*"
+        # Skip CMake built-in modules
+        if name in ("Threads", "PkgConfig", "Python3", "Python", "GTest", "Doxygen"):
+            continue
+        deps.append(Dependency(
+            name=name,
+            version=version,
+            ecosystem="cmake",
+            purl=_make_purl("cmake", name, version),
+        ))
+
+    logger.info("Found %d dependencies in %s", len(deps), path)
+    return deps
+
+
+def scan_embtrace_deps(path: Path) -> list[Dependency]:
+    """Parse a embtrace-deps.yaml manual dependency declaration."""
+    deps: list[Dependency] = []
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (yaml.YAMLError, OSError) as exc:
+        logger.warning("Failed to parse %s: %s", path, exc)
+        return deps
+
+    if not isinstance(data, dict):
+        return deps
+
+    for entry in data.get("dependencies", []):
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name", "")
+        version = entry.get("version", "")
+        if name and version:
+            # Optional per-entry ecosystem (e.g. written by embtrace.check.convert);
+            # defaults to "manual" so existing declarations behave unchanged.
+            ecosystem = str(entry.get("ecosystem") or "manual")
+            deps.append(Dependency(
+                name=name,
+                version=str(version),
+                ecosystem=ecosystem,
+                license=entry.get("license"),
+                supplier=entry.get("supplier"),
+                description=entry.get("description"),
+                purl=_make_purl(ecosystem, name, str(version)),
+            ))
+
+    logger.info("Found %d dependencies in %s", len(deps), path)
+    return deps
+
+
+def scan_cargo_lock(path: Path) -> list[Dependency]:
+    """Parse a Rust Cargo.lock (TOML) file."""
+    deps: list[Dependency] = []
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (tomllib.TOMLDecodeError, OSError) as exc:
+        logger.warning("Failed to parse %s: %s", path, exc)
+        return deps
+
+    for pkg in data.get("package", []):
+        name = pkg.get("name", "")
+        version = pkg.get("version", "")
+        # Skip local workspace crates (no source field)
+        if name and version and "source" in pkg:
+            deps.append(Dependency(
+                name=name,
+                version=version,
+                ecosystem="cargo",
+                purl=_make_purl("cargo", name, version),
+            ))
+
+    logger.info("Found %d dependencies in %s", len(deps), path)
+    return deps
+
+
+def scan_package_lock_json(path: Path) -> list[Dependency]:
+    """Parse an npm package-lock.json (v1/v2/v3) file."""
+    deps: list[Dependency] = []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning("Failed to parse %s: %s", path, exc)
+        return deps
+
+    # v2/v3 format: "packages" dict with node_modules paths
+    packages = data.get("packages", {})
+    if packages:
+        for pkg_path, info in packages.items():
+            if not pkg_path:  # Skip root entry ""
+                continue
+            # Skip workspace links (local packages, not external deps)
+            if info.get("link"):
+                continue
+            version = info.get("version", "")
+            if not version:
+                continue
+            # Extract name from path: "node_modules/@scope/name" → "@scope/name"
+            parts = pkg_path.split("node_modules/")
+            name = parts[-1] if parts else pkg_path
+            if name:
+                deps.append(Dependency(
+                    name=name,
+                    version=version,
+                    ecosystem="npm",
+                    purl=_make_purl("npm", name, version),
+                ))
+    else:
+        # v1 fallback: "dependencies" dict
+        for name, info in data.get("dependencies", {}).items():
+            version = info.get("version", "")
+            if name and version:
+                deps.append(Dependency(
+                    name=name,
+                    version=version,
+                    ecosystem="npm",
+                    purl=_make_purl("npm", name, version),
+                ))
+
+    logger.info("Found %d dependencies in %s", len(deps), path)
+    return deps
+
+
+_YARN_ENTRY = re.compile(r'^"?(@?[^@\s"][^"]*?)@')
+_YARN_VERSION = re.compile(r'^\s+version\s+"(.+)"')
+
+
+def scan_yarn_lock(path: Path) -> list[Dependency]:
+    """Parse a Yarn Classic (v1) yarn.lock file."""
+    deps: list[Dependency] = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        logger.warning("Failed to read %s: %s", path, exc)
+        return deps
+
+    current_name: str | None = None
+    seen: set[str] = set()
+
+    for line in lines:
+        if not line or line.startswith("#"):
+            continue
+        # Entry header: "name@version:" or "name@version, name@version:"
+        entry_match = _YARN_ENTRY.match(line)
+        if entry_match and not line.startswith(" "):
+            current_name = entry_match.group(1)
+            continue
+        # Version line under current entry
+        version_match = _YARN_VERSION.match(line)
+        if version_match and current_name:
+            version = version_match.group(1)
+            key = f"{current_name}@{version}"
+            if key not in seen:
+                seen.add(key)
+                deps.append(Dependency(
+                    name=current_name,
+                    version=version,
+                    ecosystem="npm",
+                    purl=_make_purl("npm", current_name, version),
+                ))
+            current_name = None
+
+    logger.info("Found %d dependencies in %s", len(deps), path)
+    return deps
+
+
+def scan_pnpm_lock_yaml(path: Path) -> list[Dependency]:
+    """Parse a pnpm pnpm-lock.yaml file (v6 and v9 formats)."""
+    deps: list[Dependency] = []
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (yaml.YAMLError, OSError) as exc:
+        logger.warning("Failed to parse %s: %s", path, exc)
+        return deps
+
+    if not isinstance(data, dict):
+        return deps
+
+    packages = data.get("packages", {})
+    for key in packages:
+        # v9 format: "name@version" (e.g. "lodash@4.17.21")
+        # v6 format: "/name/version" (e.g. "/lodash/4.17.21")
+        if key.startswith("/"):
+            # v6: /name/version or /@scope/name/version
+            parts = key.lstrip("/").rsplit("/", 1)
+            if len(parts) == 2:
+                name, version = parts
+                # Clean version suffixes like "_peer-deps"
+                version = version.split("_")[0]
+            else:
+                continue
+        elif "@" in key and not key.startswith("@"):
+            # v9: name@version
+            name, _, version = key.rpartition("@")
+        elif key.startswith("@") and key.count("@") >= 2:
+            # v9 scoped: @scope/name@version
+            name, _, version = key.rpartition("@")
+        else:
+            continue
+
+        if not name or not version:
+            continue
+        # Skip workspace/local packages (file: protocol, link: protocol)
+        if version.startswith(("file:", "link:")):
+            continue
+        deps.append(Dependency(
+            name=name,
+            version=version,
+            ecosystem="npm",
+            purl=_make_purl("npm", name, version),
+        ))
+
+    logger.info("Found %d dependencies in %s", len(deps), path)
+    return deps
+
+
+def scan_gradle_lockfile(path: Path) -> list[Dependency]:
+    """Parse a Gradle gradle.lockfile (text format)."""
+    deps: list[Dependency] = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        logger.warning("Failed to read %s: %s", path, exc)
+        return deps
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        # Format: group:artifact:version=configuration(s)
+        entry = stripped.split("=")[0].strip()
+        parts = entry.split(":")
+        if len(parts) == 3:
+            group, artifact, version = parts
+            name = f"{group}/{artifact}"
+            deps.append(Dependency(
+                name=name,
+                version=version,
+                ecosystem="maven",
+                purl=_make_purl("maven", name, version),
+            ))
+
+    logger.info("Found %d dependencies in %s", len(deps), path)
+    return deps
+
+
+_MAVEN_NS = "{http://maven.apache.org/POM/4.0.0}"
+
+
+def _get_pom_own_group_id(root: ET.Element, ns: str) -> str:
+    """Extract the project's own groupId from a pom.xml root element.
+
+    Falls back to the parent groupId if the project does not declare its own.
+    Returns an empty string if neither is found.
+    """
+    # Direct <groupId> at the project level (not inside <dependencies>)
+    group_el = root.find(f"{ns}groupId")
+    if group_el is not None and group_el.text:
+        return group_el.text.strip()
+    # Inherit from <parent><groupId>
+    parent_el = root.find(f"{ns}parent")
+    if parent_el is not None:
+        parent_group_el = parent_el.find(f"{ns}groupId")
+        if parent_group_el is not None and parent_group_el.text:
+            return parent_group_el.text.strip()
+    return ""
+
+
+def scan_pom_xml(path: Path) -> list[Dependency]:
+    """Parse a Maven pom.xml file for <dependency> elements.
+
+    Skips:
+    - Dependencies with unresolved ``${...}`` property placeholders in
+      groupId, artifactId, or version.
+    - Self-references: dependencies whose groupId matches the project's
+      own groupId (internal submodule references).
+    """
+    deps: list[Dependency] = []
+    try:
+        tree = ET.parse(path)  # noqa: S314
+    except (ET.ParseError, OSError) as exc:
+        logger.warning("Failed to parse %s: %s", path, exc)
+        return deps
+
+    root = tree.getroot()
+    # Detect namespace — some pom.xml files use the Maven namespace, some don't
+    ns = _MAVEN_NS if root.tag.startswith("{") else ""
+
+    own_group_id = _get_pom_own_group_id(root, ns)
+
+    for dep_elem in root.iter(f"{ns}dependency"):
+        group_el = dep_elem.find(f"{ns}groupId")
+        artifact_el = dep_elem.find(f"{ns}artifactId")
+        version_el = dep_elem.find(f"{ns}version")
+
+        group_id = group_el.text if group_el is not None and group_el.text else ""
+        artifact_id = artifact_el.text if artifact_el is not None and artifact_el.text else ""
+        version = version_el.text if version_el is not None and version_el.text else ""
+
+        if not group_id or not artifact_id:
+            continue
+        # Skip unresolved Maven property references (${...})
+        if "${" in group_id or "${" in artifact_id or "${" in version:
+            continue
+        # Skip self-references (project's own submodules)
+        if own_group_id and group_id == own_group_id:
+            continue
+
+        name = f"{group_id}/{artifact_id}"
+        deps.append(Dependency(
+            name=name,
+            version=version if version else "*",
+            ecosystem="maven",
+            purl=_make_purl("maven", name, version if version else "*"),
+        ))
+
+    logger.info("Found %d dependencies in %s", len(deps), path)
+    return deps
+
+
+def scan_go_sum(path: Path) -> list[Dependency]:
+    """Parse a Go go.sum file."""
+    deps: list[Dependency] = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        logger.warning("Failed to read %s: %s", path, exc)
+        return deps
+
+    seen: set[tuple[str, str]] = set()
+    for line in lines:
+        parts = line.strip().split()
+        if len(parts) < 3:
+            continue
+        module = parts[0]
+        version = parts[1]
+        # Remove /go.mod suffix from version
+        version = version.split("/go.mod")[0]
+        # Remove v prefix
+        version = version.lstrip("v")
+        key = (module, version)
+        if key not in seen:
+            seen.add(key)
+            deps.append(Dependency(
+                name=module,
+                version=version,
+                ecosystem="golang",
+                purl=_make_purl("golang", module, version),
+            ))
+
+    logger.info("Found %d dependencies in %s", len(deps), path)
+    return deps
+
+
+def scan_alire_lock(path: Path) -> list[Dependency]:
+    """Parse an Ada/SPARK Alire alire.lock (TOML) file."""
+    deps: list[Dependency] = []
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (tomllib.TOMLDecodeError, OSError) as exc:
+        logger.warning("Failed to parse %s: %s", path, exc)
+        return deps
+
+    # Primary: solution.state.<crate>.version
+    solution = data.get("solution", {})
+    state = solution.get("state", {})
+    for crate_name, info in state.items():
+        if isinstance(info, dict):
+            version = info.get("version", "")
+            if version:
+                deps.append(Dependency(
+                    name=crate_name,
+                    version=version,
+                    ecosystem="alire",
+                    purl=_make_purl("alire", crate_name, version),
+                ))
+
+    # Fallback: depends-on list
+    if not deps:
+        for entry in data.get("depends-on", []):
+            if isinstance(entry, dict):
+                for crate_name, version_spec in entry.items():
+                    version = str(version_spec).strip("=^~>< ")
+                    if crate_name and version:
+                        deps.append(Dependency(
+                            name=crate_name,
+                            version=version,
+                            ecosystem="alire",
+                            purl=_make_purl("alire", crate_name, version),
+                        ))
+
+    logger.info("Found %d dependencies in %s", len(deps), path)
+    return deps
+
+
+# ---------------------------------------------------------------------------
+# Auto-detect scanner
+# ---------------------------------------------------------------------------
+
+_SCANNERS: dict[str, tuple[str, type[object] | None]] = {
+    "conan.lock": ("conan_lock", None),
+    "conanfile.txt": ("conanfile_txt", None),
+    "requirements.txt": ("requirements_txt", None),
+    "pyproject.toml": ("pyproject_toml", None),
+    "poetry.lock": ("poetry_lock", None),
+    "Pipfile.lock": ("pipfile_lock", None),
+    "vcpkg.json": ("vcpkg_json", None),
+    "CMakeLists.txt": ("cmake", None),
+    "embtrace-deps.yaml": ("embtrace_deps", None),
+    "Cargo.lock": ("cargo_lock", None),
+    "package-lock.json": ("package_lock_json", None),
+    "yarn.lock": ("yarn_lock", None),
+    "pnpm-lock.yaml": ("pnpm_lock_yaml", None),
+    "gradle.lockfile": ("gradle_lockfile", None),
+    "pom.xml": ("pom_xml", None),
+    "go.sum": ("go_sum", None),
+    "alire.lock": ("alire_lock", None),
+}
+
+_SCANNER_FUNCS = {
+    "conan_lock": scan_conan_lock,
+    "conanfile_txt": scan_conanfile_txt,
+    "requirements_txt": scan_requirements_txt,
+    "pyproject_toml": scan_pyproject_toml,
+    "poetry_lock": scan_poetry_lock,
+    "pipfile_lock": scan_pipfile_lock,
+    "vcpkg_json": scan_vcpkg_json,
+    "cmake": scan_cmake,
+    "embtrace_deps": scan_embtrace_deps,
+    "cargo_lock": scan_cargo_lock,
+    "package_lock_json": scan_package_lock_json,
+    "yarn_lock": scan_yarn_lock,
+    "pnpm_lock_yaml": scan_pnpm_lock_yaml,
+    "gradle_lockfile": scan_gradle_lockfile,
+    "pom_xml": scan_pom_xml,
+    "go_sum": scan_go_sum,
+    "alire_lock": scan_alire_lock,
+}
+
+
+def scan_directory(path: Path) -> list[Dependency]:
+    """Auto-detect and scan all supported dependency files in a directory.
+
+    Args:
+        path: Directory to scan.
+
+    Returns:
+        Combined list of all discovered dependencies (may contain duplicates).
+    """
+    all_deps: list[Dependency] = []
+
+    for filename, (scanner_key, _) in _SCANNERS.items():
+        filepath = path / filename
+        if filepath.is_file():
+            logger.info("Detected %s", filepath)
+            scanner_fn = _SCANNER_FUNCS[scanner_key]
+            all_deps.extend(scanner_fn(filepath))
+
+    # Manual deps (embtrace-deps.yaml) are authoritative — when a manual entry
+    # exists for a component, drop auto-detected entries with the same name so
+    # the richer metadata (supplier, license, purl) is kept.
+    manual_names: set[str] = {
+        dep.name for dep in all_deps if dep.ecosystem == "manual"
+    }
+    if manual_names:
+        filtered: list[Dependency] = []
+        for dep in all_deps:
+            if dep.ecosystem != "manual" and dep.name in manual_names:
+                logger.debug(
+                    "Suppressing auto-detected %s (%s v%s) — manual entry exists",
+                    dep.name, dep.ecosystem, dep.version,
+                )
+                continue
+            filtered.append(dep)
+        all_deps = filtered
+
+    # Deduplicate by (name, version, ecosystem)
+    seen: set[tuple[str, str, str]] = set()
+    unique: list[Dependency] = []
+    for dep in all_deps:
+        key = (dep.name, dep.version, dep.ecosystem)
+        if key not in seen:
+            seen.add(key)
+            unique.append(dep)
+
+    logger.info("Total: %d unique dependencies in %s", len(unique), path)
+    return unique
+
+
+def scan_directory_recursive(path: Path, *, max_depth: int = 5) -> list[Dependency]:
+    """Recursively scan a directory tree for dependency files.
+
+    Walks all subdirectories up to *max_depth* and calls :func:`scan_directory`
+    for each.  Results are deduplicated by ``(name, version, ecosystem)``.
+
+    This is used by the analyzer flow (``embtrace init --scan``) to find
+    lockfiles in mono-repos and nested sub-projects.
+
+    Args:
+        path: Root directory to scan.
+        max_depth: Maximum directory depth to recurse into.
+
+    Returns:
+        Combined, deduplicated list of all discovered dependencies.
+    """
+    all_deps: list[Dependency] = []
+    seen_dirs: set[Path] = set()
+
+    def _walk(current: Path, depth: int) -> None:
+        resolved = current.resolve()
+        if resolved in seen_dirs:
+            return
+        seen_dirs.add(resolved)
+
+        # Scan this directory
+        all_deps.extend(scan_directory(current))
+
+        if depth >= max_depth:
+            return
+
+        # Recurse into subdirectories
+        try:
+            entries = sorted(current.iterdir())
+        except OSError:
+            return
+        for entry in entries:
+            if not entry.is_dir():
+                continue
+            # Skip hidden dirs, build dirs, and VCS dirs
+            name = entry.name
+            if name.startswith(".") or name in (
+                "node_modules", "__pycache__", "build", "cmake-build",
+                "target", "vendor", ".git",
+            ):
+                continue
+            _walk(entry, depth + 1)
+
+    _walk(path, 0)
+
+    # Deduplicate across all directories
+    seen: set[tuple[str, str, str]] = set()
+    unique: list[Dependency] = []
+    for dep in all_deps:
+        key = (dep.name, dep.version, dep.ecosystem)
+        if key not in seen:
+            seen.add(key)
+            unique.append(dep)
+
+    logger.info(
+        "Recursive scan: %d unique dependencies in %s (depth=%d)",
+        len(unique), path, max_depth,
+    )
+    return unique

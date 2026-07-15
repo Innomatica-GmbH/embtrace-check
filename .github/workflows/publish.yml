@@ -1,0 +1,29 @@
+name: publish
+on:
+  release: { types: [published] }
+jobs:
+  pypi:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions: { id-token: write }   # PyPI Trusted Publishing
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install build && python -m build
+      - uses: pypa/gh-action-pypi-publish@release/v1
+  binary:
+    runs-on: ubuntu-22.04   # aeltere glibc = laeuft auf mehr Zielsystemen
+    permissions: { contents: write }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install . pyinstaller
+      - run: pyinstaller embtrace-check.spec --clean --noconfirm
+      - run: |
+          BIN=embtrace-check-${GITHUB_REF_NAME#v}-linux-x86_64
+          mv dist/embtrace-check "dist/$BIN"
+          ( cd dist && sha256sum "$BIN" > "$BIN.sha256" )
+      - uses: softprops/action-gh-release@v2
+        with: { files: "dist/embtrace-check-*" }
