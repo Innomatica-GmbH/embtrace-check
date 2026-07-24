@@ -33,7 +33,8 @@ embtrace-check . --dry-run     # prints the exact payload, uploads nothing
 2. Run the collector in your project folder:
 
 ```bash
-pip install embtrace-check          # or download the standalone binary
+pipx install embtrace-check         # or: pip install embtrace-check,
+                                    #     or download the standalone binary
 embtrace-check . --code CHK-XXXX-YYYY
 ```
 
