@@ -7,8 +7,8 @@ import urllib.error
 import urllib.request
 
 from embtrace_check import __version__
-from embtrace_check.payload import MAX_PAYLOAD_BYTES, CheckPayload
 from embtrace_check.core.exceptions import CheckUploadError
+from embtrace_check.payload import MAX_PAYLOAD_BYTES, CheckPayload
 
 DEFAULT_SUBMIT_URL = "https://api.embtrace.dev/api/v1/check/submit"
 

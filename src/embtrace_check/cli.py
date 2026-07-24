@@ -19,9 +19,9 @@ from rich.console import Console
 
 from embtrace_check import __version__
 from embtrace_check.collector import collect_components
+from embtrace_check.core.exceptions import EmbtraceError
 from embtrace_check.payload import build_payload
 from embtrace_check.upload import DEFAULT_SUBMIT_URL, serialize_payload, upload_payload
-from embtrace_check.core.exceptions import EmbtraceError
 
 _PRIVACY_URL = "https://embtrace.dev/check-privacy"
 

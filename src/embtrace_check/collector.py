@@ -19,8 +19,8 @@ from typing import TYPE_CHECKING
 from embtrace_check.analyzer.normalize import normalize_dep_name
 from embtrace_check.analyzer.pipeline import run_pipeline
 from embtrace_check.analyzer.scanner import collect_build_files
-from embtrace_check.payload import CheckComponent, CheckStats
 from embtrace_check.core.exceptions import CheckCollectionError
+from embtrace_check.payload import CheckComponent, CheckStats
 from embtrace_check.sbom.scanner import scan_directory_recursive
 
 if TYPE_CHECKING:
