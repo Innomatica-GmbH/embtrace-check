@@ -1,6 +1,7 @@
 name: publish
 on:
-  release: { types: [published] }
+  push:
+    tags: ["v*"]
 jobs:
   pypi:
     runs-on: ubuntu-latest
@@ -26,4 +27,7 @@ jobs:
           mv dist/embtrace-check "dist/$BIN"
           ( cd dist && sha256sum "$BIN" > "$BIN.sha256" )
       - uses: softprops/action-gh-release@v2
-        with: { files: "dist/embtrace-check-*" }
+        with:
+          name: embtrace-check ${{ github.ref_name }}
+          body_path: .github/release-notes/${{ github.ref_name }}.md
+          files: "dist/embtrace-check-*"
