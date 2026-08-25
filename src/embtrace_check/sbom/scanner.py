@@ -261,9 +261,10 @@ def scan_pyproject_toml(path: Path) -> list[Dependency]:
     to put into an SBOM).
     """
     deps: list[Dependency] = []
-    if path.with_name("poetry.lock").is_file():
-        logger.info("Skipping %s — poetry.lock present", path)
-        return deps
+    for lockfile in ("poetry.lock", "uv.lock"):
+        if path.with_name(lockfile).is_file():
+            logger.info("Skipping %s — %s present", path, lockfile)
+            return deps
 
     try:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
@@ -338,6 +339,41 @@ def scan_poetry_lock(path: Path) -> list[Dependency]:
                 ecosystem="pypi",
                 purl=_make_purl("pypi", name, version),
                 description=pkg.get("description"),
+            ))
+
+    logger.info("Found %d dependencies in %s", len(deps), path)
+    return deps
+
+
+def scan_uv_lock(path: Path) -> list[Dependency]:
+    """Parse a uv uv.lock (TOML) file.
+
+    The lockfile carries the fully resolved transitive closure of a uv
+    project or workspace. Workspace members themselves (``source`` is
+    ``editable``/``virtual``/``directory``) are the scanned project's own
+    code, not third-party dependencies, and are skipped.
+    """
+    deps: list[Dependency] = []
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (tomllib.TOMLDecodeError, OSError) as exc:
+        logger.warning("Failed to parse %s: %s", path, exc)
+        return deps
+
+    for pkg in data.get("package", []):
+        name = pkg.get("name", "")
+        version = pkg.get("version", "")
+        source = pkg.get("source", {})
+        if isinstance(source, dict) and (
+            "editable" in source or "virtual" in source or "directory" in source
+        ):
+            continue
+        if name and version:
+            deps.append(Dependency(
+                name=name,
+                version=version,
+                ecosystem="pypi",
+                purl=_make_purl("pypi", name, version),
             ))
 
     logger.info("Found %d dependencies in %s", len(deps), path)
@@ -834,6 +870,7 @@ _SCANNERS: dict[str, tuple[str, type[object] | None]] = {
     "requirements.txt": ("requirements_txt", None),
     "pyproject.toml": ("pyproject_toml", None),
     "poetry.lock": ("poetry_lock", None),
+    "uv.lock": ("uv_lock", None),
     "Pipfile.lock": ("pipfile_lock", None),
     "vcpkg.json": ("vcpkg_json", None),
     "CMakeLists.txt": ("cmake", None),
@@ -854,6 +891,7 @@ _SCANNER_FUNCS = {
     "requirements_txt": scan_requirements_txt,
     "pyproject_toml": scan_pyproject_toml,
     "poetry_lock": scan_poetry_lock,
+    "uv_lock": scan_uv_lock,
     "pipfile_lock": scan_pipfile_lock,
     "vcpkg_json": scan_vcpkg_json,
     "cmake": scan_cmake,
