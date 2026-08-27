@@ -15,12 +15,17 @@ Transmitted (JSON, ~a few kB):
 
 - names, versions and package ecosystems of your dependencies
   (from lockfiles and build files: Conan, vcpkg, CMake, Cargo, npm/yarn/pnpm,
-  Python, Go, Maven/Gradle, Meson, and more),
+  Python incl. uv, Go, Maven/Gradle, Meson, and more),
+- names and versions of FPGA IP cores
+  (AMD/Xilinx Vivado `.hwh`/`.xci`, Microchip Libero Tcl/`.cxf`,
+  Intel/Altera Quartus `*_hw.tcl`),
 - the project folder name (hash it with `--anonymize`),
 - scan statistics (number of build files, tool version).
 
 **Never transmitted:** source code, file paths, file contents, configuration,
-credentials. See for yourself before sending anything:
+credentials. The supplier of an FPGA IP core is known locally but
+deliberately **not** transmitted — names, versions and ecosystems only.
+See for yourself before sending anything:
 
 ```bash
 embtrace-check . --dry-run     # prints the exact payload, uploads nothing
