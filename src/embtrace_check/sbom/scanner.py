@@ -17,24 +17,24 @@ Supports:
 - go.sum                      (Go Modules)
 - alire.lock                  (Ada/SPARK Alire)
 - embtrace-deps.yaml          (manual declaration for proprietary libs)
+- *.hwh / *.xci / *.tcl / *.cxf  (FPGA IP cores — Vivado, Libero incl.
+                               generated-data version resolution, Quartus)
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 import tomllib
 import xml.etree.ElementTree as ET
-from typing import TYPE_CHECKING
+from pathlib import Path
 from urllib.parse import quote
 
 import yaml
 from pydantic import BaseModel
 
 from embtrace_check.core.log import get_logger
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 logger = get_logger(__name__)
 
@@ -860,6 +860,260 @@ def scan_alire_lock(path: Path) -> list[Dependency]:
     return deps
 
 
+def _fpga_purl(vendor: str, name: str, version: str) -> str:
+    """purl for an FPGA IP core — vendor as namespace keeps same-named cores
+    from different suppliers distinguishable. Version omitted when unknown."""
+    base = f"pkg:generic/{quote(vendor, safe='')}/{quote(name, safe='')}"
+    return f"{base}@{quote(version, safe='')}" if version else base
+
+
+def _vlnv_to_dep(
+    vlnv: str,
+    seen: set[str],
+    *,
+    allow_missing_version: bool = False,
+    note: str = "",
+) -> Dependency | None:
+    """Turn a VLNV string (``vendor:library:name:version``) into a Dependency.
+
+    VLNV is the IP-XACT / IEEE-1685 identifier every FPGA IP core carries.
+    Bus *interface* definitions (library ``interface``) are specifications,
+    not delivered components, and multiple instantiations of the same core
+    are one component — deduplicated over ``vendor:name:version``.
+
+    ``allow_missing_version`` covers Libero's ``*`` wildcard: the core is
+    reported with an EMPTY version (the audit then flags it honestly)
+    instead of being dropped or guessed.
+    """
+    parts = vlnv.split(":")
+    if len(parts) != 4:
+        return None
+    vendor, library, name, version = (p.strip() for p in parts)
+    if version == "*":
+        version = ""
+    if not name or library.lower() == "interface":
+        return None
+    if not version and not allow_missing_version:
+        return None
+    key = f"{vendor}:{name}:{version}"
+    if key in seen:
+        return None
+    seen.add(key)
+    description = (
+        f"FPGA IP core ({vendor}, library {library})" if vendor else "FPGA IP core"
+    )
+    if note:
+        description = f"{description} — {note}"
+    return Dependency(
+        name=name,
+        version=version,
+        ecosystem="fpga-ip",
+        supplier=vendor or None,
+        purl=(_fpga_purl(vendor, name, version) if vendor
+              else _make_purl("manual", name, version or "0")),
+        description=description,
+    )
+
+
+def scan_vivado_hwh(path: Path) -> list[Dependency]:
+    """Parse a Vivado hardware handoff (.hwh) — the full IP list of a design.
+
+    The handoff carries one ``VLNV="vendor:library:name:version"`` attribute
+    per instantiated IP core, so a single file yields the complete inventory
+    of a block design including third-party cores.
+    """
+    deps: list[Dependency] = []
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError as exc:
+        logger.warning("Failed to read %s: %s", path, exc)
+        return deps
+
+    seen: set[str] = set()
+    for vlnv in re.findall(r'VLNV="([^"]+)"', text):
+        dep = _vlnv_to_dep(vlnv, seen)
+        if dep is not None:
+            deps.append(dep)
+    logger.info("Found %d FPGA IP cores in %s", len(deps), path)
+    return deps
+
+
+def scan_vivado_xci(path: Path) -> list[Dependency]:
+    """Parse a single Vivado IP configuration file (.xci, IP-XACT XML).
+
+    Consulted only when no handoff file exists — one ``.xci`` describes one
+    IP core via its ``spirit:componentRef``.
+    """
+    deps: list[Dependency] = []
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError as exc:
+        logger.warning("Failed to read %s: %s", path, exc)
+        return deps
+
+    seen: set[str] = set()
+    for m in re.finditer(
+        r'<spirit:componentRef\b[^>]*'
+        r'spirit:vendor="([^"]*)"[^>]*'
+        r'spirit:library="([^"]*)"[^>]*'
+        r'spirit:name="([^"]*)"[^>]*'
+        r'spirit:version="([^"]*)"',
+        text,
+    ):
+        dep = _vlnv_to_dep(":".join(m.groups()), seen)
+        if dep is not None:
+            deps.append(dep)
+    return deps
+
+
+_LIBERO_NOTE = (
+    "version not pinned in the project (Libero '*' wildcard) — resolved at "
+    "generation time; declare the built version via embtrace-deps.yaml"
+)
+
+
+def scan_fpga_tcl(path: Path) -> list[Dependency]:
+    """Parse FPGA tool TCL files — Libero component scripts and Quartus
+    Platform Designer ``*_hw.tcl`` definitions.
+
+    Measured formats (real reference designs, 2026-08-27):
+
+    - Libero (Microchip PolarFire):
+      ``create_and_configure_core -core_vlnv {Actel:DirectCore:COREI2C:*}``
+      — the version is a ``*`` wildcard; the core is reported with an empty
+      version and an explanatory note, never with a guessed version.
+    - Quartus (Intel/Altera): ``set_module_property NAME/VERSION/GROUP`` —
+      one IP definition per ``*_hw.tcl`` file.
+    """
+    deps: list[Dependency] = []
+    try:
+        if path.stat().st_size > 5_000_000:
+            return deps
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError as exc:
+        logger.warning("Failed to read %s: %s", path, exc)
+        return deps
+
+    seen: set[str] = set()
+    for vlnv in re.findall(r"-core_vlnv\s*\{([^}]+)\}", text):
+        dep = _vlnv_to_dep(
+            vlnv, seen, allow_missing_version=True, note=_LIBERO_NOTE,
+        )
+        if dep is not None:
+            deps.append(dep)
+
+    if not deps and path.name.endswith("_hw.tcl"):
+        props = dict(re.findall(
+            r'^\s*set_module_property\s+(\w+)\s+"?([^"\n]+?)"?\s*$', text, re.M,
+        ))
+        name = props.get("NAME", "")
+        version = props.get("VERSION", "")
+        if name and version:
+            vendor = props.get("GROUP", "")
+            deps.append(Dependency(
+                name=name,
+                version=version,
+                ecosystem="fpga-ip",
+                supplier=vendor or None,
+                purl=_fpga_purl(vendor, name, version) if vendor
+                else _make_purl("manual", name, version),
+                description=props.get(
+                    "DESCRIPTION", "FPGA IP core (Quartus Platform Designer)",
+                ),
+            ))
+
+    if deps:
+        logger.info("Found %d FPGA IP cores in %s", len(deps), path)
+    return deps
+
+
+def scan_libero_cxf(path: Path) -> list[Dependency]:
+    """Parse a Libero component description (.cxf) from generated project data.
+
+    Generation resolves the ``*`` version wildcard of the project scripts —
+    the .cxf carries the actually-built VLNV as XML elements (measured on
+    real PolarFire and SmartFusion2 projects; namespace actel.com/sweng/afi).
+    First-party SmartDesigns carry EMPTY vendor/library/version elements
+    first and are skipped — they are the user's own code, not supplied IP.
+    """
+    deps: list[Dependency] = []
+    try:
+        root = ET.parse(path).getroot()
+    except (ET.ParseError, OSError) as exc:
+        logger.warning("Failed to parse %s: %s", path, exc)
+        return deps
+
+    fields: dict[str, str] = {}
+    for child in root:
+        local = child.tag.rsplit("}", 1)[-1]
+        if local in ("name", "vendor", "library", "version") and local not in fields:
+            fields[local] = (child.text or "").strip()
+
+    name = fields.get("name", "")
+    vendor = fields.get("vendor", "")
+    library = fields.get("library", "")
+    version = fields.get("version", "")
+    if not (name and vendor and library and version):
+        return deps
+
+    deps.append(Dependency(
+        name=name,
+        version=version,
+        ecosystem="fpga-ip",
+        supplier=vendor,
+        purl=_fpga_purl(vendor, name, version),
+        description=(
+            f"FPGA IP core ({vendor}, library {library}) — resolved from "
+            f"generated component data"
+        ),
+    ))
+    return deps
+
+
+#: Directories never descended into when sweeping for FPGA tool output.
+_FPGA_EXCLUDE_DIRS = {
+    ".git", ".svn", ".hg", "node_modules", ".venv", "venv",
+    "__pycache__", ".tox", ".embtrace",
+}
+
+
+def _find_fpga_files(
+    path: Path, *, max_depth: int = 8,
+) -> tuple[list[Path], list[Path], list[Path], list[Path]]:
+    """Locate FPGA tool output below *path* (bounded depth, VCS/venv pruned).
+
+    FPGA tool output is named after the design and sits deep in the build
+    tree (``src/bd/<design>/hw_handoff/``, ``script_support/components/``),
+    so unlike the manifest scanners it is matched recursively by suffix.
+    Returns ``(hwh, xci, tcl, cxf)`` — Vivado handoffs, Vivado IP configs,
+    Libero/Quartus TCL candidates, and generated Libero component data.
+    """
+    hwh: list[Path] = []
+    xci: list[Path] = []
+    tcl: list[Path] = []
+    cxf: list[Path] = []
+    base_depth = len(path.resolve().parts)
+    for root, dirnames, filenames in os.walk(path):
+        root_path = Path(root)
+        if len(root_path.resolve().parts) - base_depth >= max_depth:
+            dirnames[:] = []
+        else:
+            dirnames[:] = [
+                d for d in dirnames
+                if d not in _FPGA_EXCLUDE_DIRS and not d.startswith(".")
+            ]
+        for filename in filenames:
+            if filename.endswith(".hwh"):
+                hwh.append(root_path / filename)
+            elif filename.endswith(".xci"):
+                xci.append(root_path / filename)
+            elif filename.endswith(".tcl"):
+                tcl.append(root_path / filename)
+            elif filename.endswith(".cxf"):
+                cxf.append(root_path / filename)
+    return sorted(hwh), sorted(xci), sorted(tcl), sorted(cxf)
+
+
 # ---------------------------------------------------------------------------
 # Auto-detect scanner
 # ---------------------------------------------------------------------------
@@ -907,11 +1161,16 @@ _SCANNER_FUNCS = {
 }
 
 
-def scan_directory(path: Path) -> list[Dependency]:
+def scan_directory(path: Path, *, fpga_recursive: bool = True) -> list[Dependency]:
     """Auto-detect and scan all supported dependency files in a directory.
 
     Args:
         path: Directory to scan.
+        fpga_recursive: Sweep subdirectories for FPGA tool output (Vivado
+            names its files after the design and buries them in the build
+            tree, so they are matched by suffix, not by fixed filename).
+            :func:`scan_directory_recursive` disables this — its own walk
+            visits every directory anyway.
 
     Returns:
         Combined list of all discovered dependencies (may contain duplicates).
@@ -924,6 +1183,45 @@ def scan_directory(path: Path) -> list[Dependency]:
             logger.info("Detected %s", filepath)
             scanner_fn = _SCANNER_FUNCS[scanner_key]
             all_deps.extend(scanner_fn(filepath))
+
+    # FPGA IP cores: a Vivado handoff (.hwh) already lists every core of a
+    # block design — per-IP .xci files are only consulted when no handoff
+    # exists, otherwise every core would be counted twice. Libero/Quartus
+    # TCL files are an independent toolchain and always scanned.
+    if fpga_recursive:
+        hwh_files, xci_files, tcl_files, cxf_files = _find_fpga_files(path)
+    else:
+        hwh_files = sorted(path.glob("*.hwh"))
+        xci_files = sorted(path.glob("*.xci"))
+        tcl_files = sorted(path.glob("*.tcl"))
+        cxf_files = sorted(path.glob("*.cxf"))
+    for hwh_file in hwh_files:
+        logger.info("Detected %s", hwh_file)
+        all_deps.extend(scan_vivado_hwh(hwh_file))
+    if not hwh_files:
+        for xci_file in xci_files:
+            logger.info("Detected %s", xci_file)
+            all_deps.extend(scan_vivado_xci(xci_file))
+    for tcl_file in tcl_files:
+        all_deps.extend(scan_fpga_tcl(tcl_file))
+    for cxf_file in cxf_files:
+        all_deps.extend(scan_libero_cxf(cxf_file))
+
+    # Post-build enrichment: generated component data (.cxf) carries the
+    # resolved version — it supersedes script-derived entries whose version
+    # is unpinned (Libero '*' wildcard).
+    versioned_fpga = {
+        f"{(d.supplier or '').lower()}:{d.name.lower()}"
+        for d in all_deps if d.ecosystem == "fpga-ip" and d.version
+    }
+    if versioned_fpga:
+        all_deps = [
+            d for d in all_deps
+            if not (
+                d.ecosystem == "fpga-ip" and not d.version
+                and f"{(d.supplier or '').lower()}:{d.name.lower()}" in versioned_fpga
+            )
+        ]
 
     # Manual deps (embtrace-deps.yaml) are authoritative — when a manual entry
     # exists for a component, drop auto-detected entries with the same name so
@@ -982,7 +1280,7 @@ def scan_directory_recursive(path: Path, *, max_depth: int = 5) -> list[Dependen
         seen_dirs.add(resolved)
 
         # Scan this directory
-        all_deps.extend(scan_directory(current))
+        all_deps.extend(scan_directory(current, fpga_recursive=False))
 
         if depth >= max_depth:
             return
