@@ -60,6 +60,12 @@ class Dependency(BaseModel):
     purl: str | None = None
     cpe: str | None = None
     description: str | None = None
+    # Provenance class of the version: "" = resolved/pinned (lockfile or
+    # exact pin), "manifest" = a constraint-derived minimum from a manifest
+    # (pyproject `>=`, requirements `>=`, CMake find_package). Manifest
+    # versions lose against a resolved version of the same package
+    # (see prefer_locked) — they are floors, not facts.
+    source_kind: str = ""
 
     # ------------------------------------------------------------------
     # BSI TR-03183-2 v2.1.0 metadata (all optional, populated on demand)
@@ -217,14 +223,16 @@ def scan_requirements_txt(path: Path) -> list[Dependency]:
         if not stripped or stripped.startswith("#") or stripped.startswith("-"):
             continue
         # Match: package==version or package>=version etc.
-        match = re.match(r"^([a-zA-Z0-9_.-]+)\s*[=~!<>]=*\s*([a-zA-Z0-9._*-]+)", stripped)
+        match = re.match(r"^([a-zA-Z0-9_.-]+)\s*([=~!<>]=*)\s*([a-zA-Z0-9._*-]+)", stripped)
         if match:
-            name, version = match.group(1), match.group(2)
+            name, operator, version = match.group(1), match.group(2), match.group(3)
             deps.append(Dependency(
                 name=name,
                 version=version,
                 ecosystem="pypi",
                 purl=_make_purl("pypi", name, version),
+                # ">=1.2" names a floor, not the deployed version.
+                source_kind="" if operator == "==" else "manifest",
             ))
 
     logger.info("Found %d dependencies in %s", len(deps), path)
@@ -279,6 +287,9 @@ def scan_pyproject_toml(path: Path) -> list[Dependency]:
                 version=version,
                 ecosystem="pypi",
                 purl=_make_purl("pypi", name, version),
+                # pyproject constraints are floors/ranges, not resolved
+                # versions — only a lockfile knows what is deployed.
+                source_kind="manifest",
             ))
 
     # PEP 621 [project.dependencies] / [project.optional-dependencies]
@@ -475,6 +486,8 @@ def scan_cmake(path: Path) -> list[Dependency]:
             version=version,
             ecosystem="cmake",
             purl=_make_purl("cmake", name, version),
+            # find_package(X 1.2) declares a minimum, not the linked version.
+            source_kind="manifest",
         ))
 
     logger.info("Found %d dependencies in %s", len(deps), path)
@@ -1254,14 +1267,90 @@ def scan_directory(path: Path, *, fpga_recursive: bool = True) -> list[Dependenc
     return unique
 
 
+#: Directories never scanned for dependencies — build outputs and vendored
+#: trees produce duplicate/phantom components (hidden dirs are skipped too).
+DEFAULT_EXCLUDE_DIRS: frozenset[str] = frozenset({
+    "node_modules", "__pycache__", "build", "cmake-build",
+    "target", "vendor", "dist", "venv",
+})
+
+#: Project-local ignore file — one glob pattern per line, ``#`` comments.
+#: Patterns match directory names and paths relative to the scan root
+#: (e.g. ``staging``, ``firmware/generated``, ``*.bak``).
+IGNORE_FILENAME = ".embtraceignore"
+
+
+def load_ignore_patterns(root: Path) -> list[str]:
+    """Read ``.embtraceignore`` at *root* (empty list when absent)."""
+    ignore_file = root / IGNORE_FILENAME
+    if not ignore_file.is_file():
+        return []
+    try:
+        lines = ignore_file.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        logger.warning("Cannot read %s: %s", ignore_file, exc)
+        return []
+    patterns = [
+        stripped.rstrip("/")
+        for line in lines
+        if (stripped := line.strip()) and not stripped.startswith("#")
+    ]
+    if patterns:
+        logger.info("Loaded %d ignore patterns from %s", len(patterns), ignore_file)
+    return patterns
+
+
+def _is_ignored(rel_path: str, name: str, patterns: list[str]) -> bool:
+    """Match a directory (name or root-relative path) against ignore globs."""
+    import fnmatch
+
+    return any(
+        fnmatch.fnmatch(name, pat) or fnmatch.fnmatch(rel_path, pat)
+        for pat in patterns
+    )
+
+
+def prefer_locked(deps: list[Dependency]) -> list[Dependency]:
+    """Drop manifest-constraint entries shadowed by a resolved version.
+
+    A pyproject ``pillow>=10.0`` next to a lockfile ``pillow 12.3.0`` must
+    not become a second, phantom component with false-positive CVEs — the
+    resolved version is the deployed truth, the constraint is only a floor.
+    Manifest entries without any resolved counterpart are kept (a
+    manifest-only project still gets its best-effort versions).
+    """
+    resolved_names = {
+        dep.name.lower().replace("_", "-")
+        for dep in deps
+        if dep.source_kind != "manifest"
+    }
+    kept: list[Dependency] = []
+    dropped = 0
+    for dep in deps:
+        if (
+            dep.source_kind == "manifest"
+            and dep.name.lower().replace("_", "-") in resolved_names
+        ):
+            dropped += 1
+            continue
+        kept.append(dep)
+    if dropped:
+        logger.info(
+            "Dropped %d manifest-constraint entr%s shadowed by resolved versions",
+            dropped, "y" if dropped == 1 else "ies",
+        )
+    return kept
+
+
 def scan_directory_recursive(path: Path, *, max_depth: int = 5) -> list[Dependency]:
     """Recursively scan a directory tree for dependency files.
 
     Walks all subdirectories up to *max_depth* and calls :func:`scan_directory`
-    for each.  Results are deduplicated by ``(name, version, ecosystem)``.
-
-    This is used by the analyzer flow (``embtrace init --scan``) to find
-    lockfiles in mono-repos and nested sub-projects.
+    for each.  Results are deduplicated by ``(name, version, ecosystem)``;
+    manifest-constraint versions shadowed by a resolved version of the same
+    package are dropped (:func:`prefer_locked`). Build-output directories
+    (:data:`DEFAULT_EXCLUDE_DIRS`), hidden directories, and everything
+    matched by a ``.embtraceignore`` at *path* are skipped.
 
     Args:
         path: Root directory to scan.
@@ -1272,6 +1361,7 @@ def scan_directory_recursive(path: Path, *, max_depth: int = 5) -> list[Dependen
     """
     all_deps: list[Dependency] = []
     seen_dirs: set[Path] = set()
+    ignore_patterns = load_ignore_patterns(path)
 
     def _walk(current: Path, depth: int) -> None:
         resolved = current.resolve()
@@ -1293,18 +1383,24 @@ def scan_directory_recursive(path: Path, *, max_depth: int = 5) -> list[Dependen
         for entry in entries:
             if not entry.is_dir():
                 continue
-            # Skip hidden dirs, build dirs, and VCS dirs
+            # Skip hidden dirs, build-output dirs, VCS dirs, and ignores
             name = entry.name
-            if name.startswith(".") or name in (
-                "node_modules", "__pycache__", "build", "cmake-build",
-                "target", "vendor", ".git",
-            ):
+            if name.startswith(".") or name in DEFAULT_EXCLUDE_DIRS:
+                continue
+            try:
+                rel = entry.relative_to(path).as_posix()
+            except ValueError:
+                rel = name
+            if _is_ignored(rel, name, ignore_patterns):
+                logger.info("Skipping %s (.embtraceignore)", rel)
                 continue
             _walk(entry, depth + 1)
 
     _walk(path, 0)
 
-    # Deduplicate across all directories
+    # Manifest floors lose against resolved versions across the whole tree,
+    # then deduplicate across all directories.
+    all_deps = prefer_locked(all_deps)
     seen: set[tuple[str, str, str]] = set()
     unique: list[Dependency] = []
     for dep in all_deps:

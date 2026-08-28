@@ -1,3 +1,3 @@
 """embtrace-check — standalone collector for the embtrace CRA Readiness Check."""
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"

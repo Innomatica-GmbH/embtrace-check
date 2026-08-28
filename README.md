@@ -31,6 +31,11 @@ See for yourself before sending anything:
 embtrace-check . --dry-run     # prints the exact payload, uploads nothing
 ```
 
+Build outputs (`dist/`, `build/`, `node_modules/`, …) and hidden
+directories are never scanned. Project-specific excludes go into a
+committed `.embtraceignore` at the project root — one glob pattern per
+line, `#` comments.
+
 ## Usage
 
 1. Get your free one-time code at **<https://embtrace.dev/check>**

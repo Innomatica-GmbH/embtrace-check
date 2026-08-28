@@ -80,8 +80,15 @@ def collect_build_files(
     Returns:
         List of (file_path, file_type) tuples.
     """
+    from embtrace_check.sbom.scanner import (
+        DEFAULT_EXCLUDE_DIRS,
+        _is_ignored,
+        load_ignore_patterns,
+    )
+
     found: list[tuple[Path, str]] = []
     seen_paths: set[Path] = set()
+    ignore_patterns = load_ignore_patterns(path)
 
     for pattern, file_type in BUILD_FILE_PATTERNS:
         for match in path.glob(pattern):
@@ -94,6 +101,23 @@ def collect_build_files(
             except ValueError:
                 continue
             if len(relative.parts) > max_depth:
+                continue
+
+            # Skip build outputs (dist/staging copies of the source tree
+            # produce duplicate conflicts), hidden dirs, and ignores.
+            parent_parts = relative.parts[:-1]
+            if any(
+                part.startswith(".") or part in DEFAULT_EXCLUDE_DIRS
+                for part in parent_parts
+            ):
+                continue
+            if ignore_patterns and any(
+                _is_ignored(
+                    "/".join(parent_parts[: i + 1]), parent_parts[i], ignore_patterns,
+                )
+                for i in range(len(parent_parts))
+            ):
+                logger.info("Skipping %s (.embtraceignore)", relative)
                 continue
 
             resolved = match.resolve()
@@ -109,10 +133,6 @@ def collect_build_files(
                         continue
                 except OSError:
                     continue
-
-            # Skip node_modules package.json files
-            if "node_modules" in str(relative):
-                continue
 
             found.append((match, file_type))
             logger.info("Found build file: %s (%s)", match, file_type)

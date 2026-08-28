@@ -33,6 +33,8 @@ _TOOL_TIER = 1
 
 #: Confidence assigned to lockfile-derived components (structured parse).
 _LOCKFILE_CONFIDENCE = 0.95
+#: Confidence for manifest-constraint floors (">=" — version unconfirmed).
+_MANIFEST_CONFIDENCE = 0.7
 _LOCKFILE_TIER = 2
 
 
@@ -60,19 +62,23 @@ def collect_components(
         raise CheckCollectionError(msg)
 
     # Path 1: lockfiles / manifests — these win on conflict (they carry
-    # pinned versions), so they are inserted first.
+    # pinned versions), so they are inserted first. Manifest-constraint
+    # floors already lost against resolved versions inside
+    # scan_directory_recursive (prefer_locked); the survivors are labelled
+    # honestly — a ">=" floor is not a lockfile fact.
     merged: dict[str, CheckComponent] = {}
     for dep in scan_directory_recursive(path, max_depth=max_depth):
         key = normalize_dep_name(dep.name)
         if key in merged:
             continue
+        is_floor = dep.source_kind == "manifest"
         merged[key] = CheckComponent(
             name=dep.name,
             version=dep.version,
             ecosystem=dep.ecosystem,
-            source_type="lockfile",
+            source_type="manifest" if is_floor else "lockfile",
             tier=_LOCKFILE_TIER,
-            confidence=_LOCKFILE_CONFIDENCE,
+            confidence=_MANIFEST_CONFIDENCE if is_floor else _LOCKFILE_CONFIDENCE,
         )
 
     # Path 2: build-file pipeline (deterministic tiers only).
