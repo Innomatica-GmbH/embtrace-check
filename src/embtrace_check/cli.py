@@ -1,7 +1,7 @@
 """CLI entry point for embtrace-check (standalone CRA Readiness Check collector).
 
 Usage:
-    embtrace-check . --code CHK-ACME-7F3A     # one-time code from embtrace_check.dev/check
+    embtrace-check . --code CHK-ACME-7F3A     # one-time code from embtrace.dev/check
     embtrace-check . --dry-run                # show exactly what would be sent
     embtrace-check . --output payload.json    # offline / firewall fallback
     embtrace-check . --voucher STOIL-2026 --email cto@example.com   # partner voucher
@@ -44,6 +44,11 @@ _stdout = Console(soft_wrap=True)
 )
 @click.option("--voucher", default="", help="Partner voucher / campaign code.")
 @click.option(
+    "--lang", type=click.Choice(["de", "en"]), default=None,
+    help="Report language. Default: the language of the landing page "
+         "your code was issued on (German if undeterminable).",
+)
+@click.option(
     "--email",
     "contact_email",
     default="",
@@ -71,6 +76,14 @@ _stdout = Console(soft_wrap=True)
     help="Additionally use native package-manager CLIs (cargo, go, npm, ...) if installed.",
 )
 @click.option(
+    "--no-declared-metadata",
+    "no_declared_metadata",
+    is_flag=True,
+    help="Do not transmit supplier/license/purl/cpe you declared in "
+    "embtrace-deps.yaml (they are included by default because you wrote "
+    "them for SBOM purposes; --dry-run shows the payload either way).",
+)
+@click.option(
     "--url",
     default=DEFAULT_SUBMIT_URL,
     show_default=False,
@@ -80,29 +93,35 @@ def main(  # noqa: PLR0913 — CLI surface, mirrors documented flags
     path: Path,
     code: str,
     voucher: str,
+    lang: str | None,
     contact_email: str,
     dry_run: bool,
     output: Path | None,
     anonymize: bool,
     with_tools: bool,
+    no_declared_metadata: bool,
     url: str,
 ) -> None:
     """Collect dependency metadata for the embtrace CRA Readiness Check.
 
     Scans PATH (default: current directory) for lockfiles and build files,
-    then uploads component names/versions — never code, never file paths.
-    Privacy notice: https://embtrace.dev/check-privacy
+    then uploads component names/versions of discovered components — plus
+    the supplier/license/purl/cpe you declared yourself in
+    embtrace-deps.yaml (disable with --no-declared-metadata). Never code,
+    never file paths. Privacy notice: https://embtrace.dev/check-privacy
     """
     try:
         _run(
             path=path,
             code=code,
             voucher=voucher,
+            lang=lang,
             contact_email=contact_email,
             dry_run=dry_run,
             output=output,
             anonymize=anonymize,
             with_tools=with_tools,
+            no_declared_metadata=no_declared_metadata,
             url=url,
         )
     except EmbtraceError as exc:
@@ -115,11 +134,13 @@ def _run(  # noqa: PLR0913 — mirrors the CLI surface
     path: Path,
     code: str,
     voucher: str,
+    lang: str | None = None,
     contact_email: str,
     dry_run: bool,
     output: Path | None,
     anonymize: bool,
     with_tools: bool,
+    no_declared_metadata: bool = False,
     url: str,
 ) -> None:
     """Execute collect → assemble → (print | write | upload)."""
@@ -145,7 +166,11 @@ def _run(  # noqa: PLR0913 — mirrors the CLI surface
             sys.exit(1)
 
     console.print(f"[bold]embtrace-check[/bold] {__version__} — scanning {path.resolve().name}/")
-    components, stats = collect_components(path, with_tools=with_tools)
+    components, stats = collect_components(
+        path,
+        with_tools=with_tools,
+        include_declared_metadata=not no_declared_metadata,
+    )
 
     if not components:
         console.print(
@@ -160,7 +185,16 @@ def _run(  # noqa: PLR0913 — mirrors the CLI surface
         f"in {stats.build_files_scanned} build files."
     )
 
+    declared = sum(1 for c in components if c.source_type == "declared")
+    if declared and not no_declared_metadata:
+        console.print(
+            f"[dim]{declared} component(s) from embtrace-deps.yaml include the "
+            f"supplier/license/purl/cpe you declared there "
+            f"(--no-declared-metadata to withhold, --dry-run to inspect).[/dim]"
+        )
+
     payload = build_payload(
+        lang=lang or "",
         voucher=voucher or code or "DRY-RUN",
         # With a personal --code the address stays empty — the server fills it
         # from the registration; the placeholder is for dry-run/offline only.

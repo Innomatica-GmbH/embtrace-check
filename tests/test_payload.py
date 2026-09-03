@@ -68,6 +68,9 @@ def test_payload_json_contains_no_paths() -> None:
     )
     raw = payload.model_dump_json()
     parsed = json.loads(raw)
+    # Explicit allowlist — extending it is a product decision.
+    # supplier/license/purl/cpe: filled only for source_type "declared"
+    # (the customer's own embtrace-deps.yaml), v0.5.0.
     assert set(parsed["components"][0].keys()) == {
         "name",
         "version",
@@ -75,6 +78,10 @@ def test_payload_json_contains_no_paths() -> None:
         "source_type",
         "tier",
         "confidence",
+        "supplier",
+        "license",
+        "purl",
+        "cpe",
     }
     assert "/" not in json.dumps([c["source_type"] for c in parsed["components"]])
     assert len(raw.encode()) < MAX_PAYLOAD_BYTES

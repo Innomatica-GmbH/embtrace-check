@@ -20,11 +20,18 @@ Transmitted (JSON, ~a few kB):
   (AMD/Xilinx Vivado `.hwh`/`.xci`, Microchip Libero Tcl/`.cxf`,
   Intel/Altera Quartus `*_hw.tcl`),
 - the project folder name (hash it with `--anonymize`),
-- scan statistics (number of build files, tool version).
+- scan statistics (number of build files, tool version),
+- **only if you wrote them yourself** in `embtrace-deps.yaml`: the
+  supplier, license, purl and CPE entries of your declaration — a
+  declaration is written for SBOM purposes, so it travels by default and
+  makes your report complete (58 instead of 17 attributed licenses on a
+  typical Zephyr project). Withhold it with `--no-declared-metadata`.
+  Discovered components never carry these fields.
 
 **Never transmitted:** source code, file paths, file contents, configuration,
-credentials. The supplier of an FPGA IP core is known locally but
-deliberately **not** transmitted — names, versions and ecosystems only.
+credentials. The supplier of a *detected* FPGA IP core is known locally but
+deliberately **not** transmitted — a supplier you declare yourself in
+`embtrace-deps.yaml` is your statement and does travel.
 See for yourself before sending anything:
 
 ```bash

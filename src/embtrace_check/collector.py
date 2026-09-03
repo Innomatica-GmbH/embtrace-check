@@ -43,6 +43,7 @@ def collect_components(
     *,
     with_tools: bool = False,
     max_depth: int = 5,
+    include_declared_metadata: bool = True,
 ) -> tuple[list[CheckComponent], CheckStats]:
     """Collect deduplicated dependency metadata from a project directory.
 
@@ -70,6 +71,24 @@ def collect_components(
     for dep in scan_directory_recursive(path, max_depth=max_depth):
         key = normalize_dep_name(dep.name)
         if key in merged:
+            continue
+        # Entries from embtrace-deps.yaml are the customer's own SBOM
+        # declaration: they keep the metadata written there (opt-out via
+        # include_declared_metadata) and are labelled "declared" so the
+        # server can tell declaration from discovery apart.
+        if dep.declared:
+            merged[key] = CheckComponent(
+                name=dep.name,
+                version=dep.version,
+                ecosystem=dep.ecosystem,
+                source_type="declared",
+                tier=_LOCKFILE_TIER,
+                confidence=1.0,
+                supplier=(dep.supplier or "") if include_declared_metadata else "",
+                license=(dep.license or "") if include_declared_metadata else "",
+                purl=(dep.purl or "") if include_declared_metadata else "",
+                cpe=(dep.cpe or "") if include_declared_metadata else "",
+            )
             continue
         is_floor = dep.source_kind == "manifest"
         merged[key] = CheckComponent(

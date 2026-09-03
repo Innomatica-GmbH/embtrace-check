@@ -1,8 +1,12 @@
 """Payload models for the CRA Readiness Check upload (schema version 1).
 
 The payload deliberately carries dependency *metadata only*: component names,
-versions and ecosystems. No file paths, no source code, no hostnames. This is
-the data-minimisation promise shown to the prospect via ``--dry-run``.
+versions and ecosystems — plus, for components you declared yourself in
+``embtrace-deps.yaml``, the supplier/license/purl/cpe you wrote there (the
+declaration was written FOR SBOM purposes; discovered components never carry
+these fields). No file paths, no source code, no hostnames. This is the
+data-minimisation promise shown to the prospect via ``--dry-run``; declared
+metadata can be withheld with ``--no-declared-metadata``.
 """
 
 from __future__ import annotations
@@ -20,14 +24,23 @@ MAX_PAYLOAD_BYTES = 2_000_000
 
 
 class CheckComponent(BaseModel):
-    """One detected third-party component (metadata only)."""
+    """One detected third-party component (metadata only).
+
+    ``supplier``/``license``/``purl``/``cpe`` are filled ONLY for
+    components declared by the customer in ``embtrace-deps.yaml``
+    (``source_type == "declared"``) — never for discovered ones.
+    """
 
     name: str
     version: str = ""
     ecosystem: str = ""
-    source_type: str = ""  # e.g. "lockfile", "regex-cmake", "cargo-metadata"
+    source_type: str = ""  # e.g. "lockfile", "declared", "regex-cmake"
     tier: int = 0
     confidence: float = 1.0
+    supplier: str = ""
+    license: str = ""
+    purl: str = ""
+    cpe: str = ""
 
 
 class CheckStats(BaseModel):
@@ -48,6 +61,10 @@ class CheckPayload(BaseModel):
     project_label: str
     components: list[CheckComponent]
     stats: CheckStats
+    #: Report language chosen by the customer ("de"/"en"). "" = not
+    #: chosen at the CLI — the server then uses the language of the
+    #: landing page the code was issued on, falling back to German.
+    lang: str = ""
 
 
 def anonymize_label(label: str) -> str:
@@ -72,6 +89,7 @@ def build_payload(
     components: list[CheckComponent],
     stats: CheckStats,
     anonymize: bool = False,
+    lang: str = "",
 ) -> CheckPayload:
     """Assemble the upload payload with a UTC collection timestamp.
 
@@ -96,4 +114,5 @@ def build_payload(
         project_label=label,
         components=sorted(components, key=lambda c: (c.name.lower(), c.ecosystem)),
         stats=stats,
+        lang=lang,
     )

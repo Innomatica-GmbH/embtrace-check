@@ -66,6 +66,11 @@ class Dependency(BaseModel):
     # versions lose against a resolved version of the same package
     # (see prefer_locked) — they are floors, not facts.
     source_kind: str = ""
+    # True only for entries the customer wrote into embtrace-deps.yaml.
+    # A declaration is authoritative and is the ONLY class of component
+    # whose supplier/license/purl/cpe may travel in the check payload
+    # (order report-vollstaendigkeit).
+    declared: bool = False
 
     # ------------------------------------------------------------------
     # BSI TR-03183-2 v2.1.0 metadata (all optional, populated on demand)
@@ -515,6 +520,8 @@ def scan_embtrace_deps(path: Path) -> list[Dependency]:
             # Optional per-entry ecosystem (e.g. written by embtrace.check.convert);
             # defaults to "manual" so existing declarations behave unchanged.
             ecosystem = str(entry.get("ecosystem") or "manual")
+            # A declared purl/cpe wins over anything synthesized (order
+            # report-vollstaendigkeit P0 — both were silently dropped).
             deps.append(Dependency(
                 name=name,
                 version=str(version),
@@ -522,7 +529,9 @@ def scan_embtrace_deps(path: Path) -> list[Dependency]:
                 license=entry.get("license"),
                 supplier=entry.get("supplier"),
                 description=entry.get("description"),
-                purl=_make_purl(ecosystem, name, str(version)),
+                purl=str(entry.get("purl") or "") or _make_purl(ecosystem, name, str(version)),
+                cpe=entry.get("cpe"),
+                declared=True,
             ))
 
     logger.info("Found %d dependencies in %s", len(deps), path)
