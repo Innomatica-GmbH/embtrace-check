@@ -431,15 +431,16 @@ def scan_vcpkg_json(path: Path) -> list[Dependency]:
 
     for entry in data.get("dependencies", []):
         if isinstance(entry, str):
+            # No pinned version — "" is the honest value, never "*".
             deps.append(Dependency(
                 name=entry,
-                version="*",
+                version="",
                 ecosystem="vcpkg",
-                purl=_make_purl("vcpkg", entry, "*"),
+                purl=f"pkg:vcpkg/{entry}",
             ))
         elif isinstance(entry, dict):
             name = entry.get("name", "")
-            version = entry.get("version>=", entry.get("version", "*"))
+            version = entry.get("version>=", entry.get("version", ""))
             if name:
                 deps.append(Dependency(
                     name=name,
@@ -482,7 +483,7 @@ def scan_cmake(path: Path) -> list[Dependency]:
 
     for match in _CMAKE_FIND_PACKAGE.finditer(content):
         name = match.group(1)
-        version = match.group(2) or "*"
+        version = match.group(2) or ""  # "" honest, never "*"
         # Skip CMake built-in modules
         if name in ("Threads", "PkgConfig", "Python3", "Python", "GTest", "Doxygen"):
             continue
@@ -496,6 +497,57 @@ def scan_cmake(path: Path) -> list[Dependency]:
         ))
 
     logger.info("Found %d dependencies in %s", len(deps), path)
+    return deps
+
+
+def scan_west_manifest(path: Path) -> list[Dependency]:
+    """Parse a Zephyr ``west.yml`` manifest (the authoritative module list).
+
+    Every module with its repository and pinned revision — without this
+    parser a Zephyr workspace scan missed its entire dependency
+    declaration (order collector-embedded-buildsysteme).
+    """
+    deps: list[Dependency] = []
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (yaml.YAMLError, OSError) as exc:
+        logger.warning("Failed to parse %s: %s", path, exc)
+        return deps
+
+    manifest = data.get("manifest") if isinstance(data, dict) else None
+    if not isinstance(manifest, dict):
+        return deps
+
+    remotes = {
+        str(r.get("name", "")): str(r.get("url-base", ""))
+        for r in manifest.get("remotes", []) or []
+        if isinstance(r, dict)
+    }
+    default_remote = str(
+        (manifest.get("defaults") or {}).get("remote", "")
+    ) or (next(iter(remotes), ""))
+
+    for project in manifest.get("projects", []) or []:
+        if not isinstance(project, dict):
+            continue
+        name = str(project.get("name", ""))
+        revision = str(project.get("revision", ""))
+        if not name or not revision:
+            continue
+        repo_path = str(project.get("repo-path", "") or name)
+        base = remotes.get(str(project.get("remote", "")) or default_remote, "")
+        purl = None
+        if base.startswith("https://github.com/"):
+            org = base[len("https://github.com/"):].strip("/")
+            purl = f"pkg:github/{org}/{repo_path}@{revision}"
+        deps.append(Dependency(
+            name=name,
+            version=revision,
+            ecosystem="github",
+            purl=purl or _make_purl("generic", name, revision),
+        ))
+
+    logger.info("Found %d west modules in %s", len(deps), path)
     return deps
 
 
@@ -798,9 +850,9 @@ def scan_pom_xml(path: Path) -> list[Dependency]:
         name = f"{group_id}/{artifact_id}"
         deps.append(Dependency(
             name=name,
-            version=version if version else "*",
+            version=version if version else "",
             ecosystem="maven",
-            purl=_make_purl("maven", name, version if version else "*"),
+            purl=(_make_purl("maven", name, version) if version else f"pkg:maven/{name}"),
         ))
 
     logger.info("Found %d dependencies in %s", len(deps), path)
@@ -1151,6 +1203,7 @@ _SCANNERS: dict[str, tuple[str, type[object] | None]] = {
     "vcpkg.json": ("vcpkg_json", None),
     "CMakeLists.txt": ("cmake", None),
     "embtrace-deps.yaml": ("embtrace_deps", None),
+    "west.yml": ("west_manifest", None),
     "Cargo.lock": ("cargo_lock", None),
     "package-lock.json": ("package_lock_json", None),
     "yarn.lock": ("yarn_lock", None),
@@ -1172,6 +1225,7 @@ _SCANNER_FUNCS = {
     "vcpkg_json": scan_vcpkg_json,
     "cmake": scan_cmake,
     "embtrace_deps": scan_embtrace_deps,
+    "west_manifest": scan_west_manifest,
     "cargo_lock": scan_cargo_lock,
     "package_lock_json": scan_package_lock_json,
     "yarn_lock": scan_yarn_lock,

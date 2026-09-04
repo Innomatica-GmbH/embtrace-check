@@ -15,7 +15,14 @@ Transmitted (JSON, ~a few kB):
 
 - names, versions and package ecosystems of your dependencies
   (from lockfiles and build files: Conan, vcpkg, CMake, Cargo, npm/yarn/pnpm,
-  Python incl. uv, Go, Maven/Gradle, Meson, and more),
+  Python incl. uv, Go, Maven/Gradle, Meson, Alire, and more),
+- **Zephyr workspaces**: the `west.yml` module manifest — every module
+  with its pinned revision,
+- **Yocto and Buildroot BUILD OUTPUT**: run the check in your build
+  directory — it reads `deploy/images/**/*.manifest` (what is actually
+  in your image) resp. `legal-info/manifest.csv`. The recipe source
+  tree only says what *could* be built, so the build output is what
+  counts,
 - names and versions of FPGA IP cores
   (AMD/Xilinx Vivado `.hwh`/`.xci`, Microchip Libero Tcl/`.cxf`,
   Intel/Altera Quartus `*_hw.tcl`),
@@ -42,6 +49,16 @@ Build outputs (`dist/`, `build/`, `node_modules/`, …) and hidden
 directories are never scanned. Project-specific excludes go into a
 committed `.embtraceignore` at the project root — one glob pattern per
 line, `#` comments.
+
+**Quality rules** (v0.6.0): component identity is (name, version,
+ecosystem) — nested second versions of one package are kept as own rows
+(the older nested version is often the vulnerable one); build tools and
+system libraries (`Doxygen`, `-lanl`, `find_package(Git)`, …) are
+dropped via a curated 950-name skip list — your own `embtrace-deps.yaml`
+declarations are never skipped; `*` and guessed versions are never
+reported — a missing version is shown as honestly missing. If no
+supported build system is found, nothing is uploaded and the tool tells
+you exactly what it looks for and where.
 
 ## Usage
 

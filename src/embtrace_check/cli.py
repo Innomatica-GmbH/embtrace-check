@@ -173,9 +173,21 @@ def _run(  # noqa: PLR0913 — mirrors the CLI surface
     )
 
     if not components:
+        # An empty report is the worst possible answer — say what would
+        # have been found where.
         console.print(
-            "[yellow]No components found.[/yellow] If this project has no lockfiles, "
-            "declare dependencies manually in embtrace-deps.yaml and re-run."
+            "[yellow]No supported build system found in this directory."
+            "[/yellow]\n"
+            "Recognised: Conan, vcpkg, CMake, Cargo, npm/yarn/pnpm, Python "
+            "(pip/poetry/uv/pipenv), Go, Maven/Gradle, Alire, Zephyr "
+            "(west.yml), FPGA projects (Vivado/Libero/Quartus) — and "
+            "Yocto/Buildroot BUILD OUTPUT.\n"
+            "For Yocto/Buildroot: run the check in your BUILD directory "
+            "(it reads deploy/images/*.manifest resp. "
+            "legal-info/manifest.csv), not in the recipe source tree.\n"
+            "For proprietary components without a package manager: declare "
+            "them once in embtrace-deps.yaml and re-run.\n"
+            "Adjust exclusions via a committed .embtraceignore."
         )
         sys.exit(2)
 
@@ -184,6 +196,15 @@ def _run(  # noqa: PLR0913 — mirrors the CLI surface
         f"({', '.join(stats.ecosystems) or 'no ecosystem info'}) "
         f"in {stats.build_files_scanned} build files."
     )
+    for src in stats.build_output_sources:
+        console.print(f"[dim]Build output: {src}[/dim]")
+    mehrfach = len(components) - len({c.name.lower() for c in components})
+    if mehrfach:
+        console.print(
+            f"[dim]{mehrfach} additional version(s) of already-listed "
+            f"packages included — nested second versions are often the "
+            f"vulnerable ones.[/dim]"
+        )
 
     declared = sum(1 for c in components if c.source_type == "declared")
     if declared and not no_declared_metadata:

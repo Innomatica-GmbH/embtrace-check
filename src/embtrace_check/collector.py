@@ -67,10 +67,20 @@ def collect_components(
     # floors already lost against resolved versions inside
     # scan_directory_recursive (prefer_locked); the survivors are labelled
     # honestly — a ">=" floor is not a lockfile fact.
-    merged: dict[str, CheckComponent] = {}
+    from embtrace_check.sbom.skiplist import is_skipped
+
+    # Identity of a component is (name, version, ecosystem) — never the
+    # name alone: npm regularly nests two versions of one package, and
+    # the older nested one is often the vulnerable one (order
+    # collector-mehrfachversionen).
+    merged: dict[tuple[str, str], CheckComponent] = {}
     for dep in scan_directory_recursive(path, max_depth=max_depth):
-        key = normalize_dep_name(dep.name)
+        key = (normalize_dep_name(dep.name), dep.version)
         if key in merged:
+            continue
+        # Curated skip list (build tools, system libs) applies to
+        # DISCOVERED components only — a declaration is never skipped.
+        if not dep.declared and is_skipped(dep.name):
             continue
         # Entries from embtrace-deps.yaml are the customer's own SBOM
         # declaration: they keep the metadata written there (opt-out via
@@ -106,8 +116,13 @@ def collect_components(
     pipeline_deps, _artifacts, _internal = run_pipeline(
         path, build_files, enabled_tiers=tiers
     )
+    seen_names = {name for name, _version in merged}
     for pdep in pipeline_deps:
-        key = normalize_dep_name(pdep.name)
+        if normalize_dep_name(pdep.name) in seen_names:
+            continue
+        if is_skipped(pdep.name):
+            continue
+        key = (normalize_dep_name(pdep.name), pdep.version)
         if key in merged:
             continue
         merged[key] = CheckComponent(
@@ -119,7 +134,33 @@ def collect_components(
             confidence=pdep.confidence,
         )
 
+    # Path 3: Yocto/Buildroot BUILD OUTPUT — what is actually in the
+    # customer's image (run the check in the build directory).
+    from embtrace_check.sbom.buildoutput import scan_build_output
+
+    build_output_deps, build_output_sources = scan_build_output(
+        path, max_depth=max_depth,
+    )
+    for dep in build_output_deps:
+        key = (normalize_dep_name(dep.name), dep.version)
+        if key in merged:
+            continue
+        if is_skipped(dep.name):
+            continue
+        merged[key] = CheckComponent(
+            name=dep.name,
+            version=dep.version,
+            ecosystem=dep.ecosystem,
+            source_type="build-output",
+            tier=_LOCKFILE_TIER,
+            confidence=_LOCKFILE_CONFIDENCE,
+        )
+
     components = list(merged.values())
     ecosystems = sorted({c.ecosystem for c in components if c.ecosystem})
-    stats = CheckStats(build_files_scanned=len(build_files), ecosystems=ecosystems)
+    stats = CheckStats(
+        build_files_scanned=len(build_files),
+        ecosystems=ecosystems,
+        build_output_sources=build_output_sources,
+    )
     return components, stats

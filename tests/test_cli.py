@@ -103,7 +103,8 @@ def test_empty_project_exits_2(tmp_path: Path) -> None:
     runner = CliRunner()
     result = runner.invoke(check_cli.main, [str(tmp_path), "--dry-run"])
     assert result.exit_code == 2
-    assert "No components found" in result.stderr
+    assert "No supported build system found" in result.stderr
+    assert "BUILD directory" in result.stderr
 
 
 def test_upload_error_maps_to_exit_1(

@@ -14,7 +14,7 @@ import re
 # This avoids matching --language → -language → "anguage",
 # fsm-listen → -listen → "isten", etc.
 _DASH_L = re.compile(
-    r"(?:^|[\s=])-l(\w+)",
+    r"(?:^|[\s=])-l([A-Za-z0-9][A-Za-z0-9_.+-]{2,})",
     re.MULTILINE,
 )
 
@@ -66,8 +66,8 @@ def parse(content: str) -> list[str]:
 
     # -l flags (only when preceded by whitespace/= to avoid word fragments)
     for m in _DASH_L.finditer(content):
-        name = m.group(1)
-        if name not in _SKIP:
+        name = m.group(1).rstrip("-.")
+        if len(name) >= 3 and name not in _SKIP:
             deps.add(name)
 
     # pkg-config calls

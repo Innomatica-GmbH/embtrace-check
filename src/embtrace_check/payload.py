@@ -48,6 +48,8 @@ class CheckStats(BaseModel):
 
     build_files_scanned: int = 0
     ecosystems: list[str] = Field(default_factory=list)
+    #: Human-readable build-output sources (file NAMES only, never paths).
+    build_output_sources: list[str] = Field(default_factory=list)
 
 
 class CheckPayload(BaseModel):
