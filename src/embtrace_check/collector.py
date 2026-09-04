@@ -37,6 +37,13 @@ _LOCKFILE_CONFIDENCE = 0.95
 _MANIFEST_CONFIDENCE = 0.7
 _LOCKFILE_TIER = 2
 
+#: Build-script name-token ecosystems — the only place the skip list
+#: may drop a name (npm/pypi homonyms like bcrypt/threads/numpy are
+#: real packages).
+_NAME_ONLY_ECOSYSTEMS = frozenset({
+    "cmake", "meson", "make", "autotools", "configure", "generic",
+})
+
 
 def collect_components(
     path: Path,
@@ -78,9 +85,15 @@ def collect_components(
         key = (normalize_dep_name(dep.name), dep.version)
         if key in merged:
             continue
-        # Curated skip list (build tools, system libs) applies to
-        # DISCOVERED components only — a declaration is never skipped.
-        if not dep.declared and is_skipped(dep.name):
+        # Curated skip list (build tools, system libs) applies only to
+        # name tokens from build scripts — a resolved lockfile entry is
+        # a real package regardless of its name (npm bcrypt/threads/util
+        # are homonyms, not tooling); declarations are never skipped.
+        if (
+            not dep.declared
+            and dep.ecosystem in _NAME_ONLY_ECOSYSTEMS
+            and is_skipped(dep.name)
+        ):
             continue
         # Entries from embtrace-deps.yaml are the customer's own SBOM
         # declaration: they keep the metadata written there (opt-out via
@@ -120,7 +133,7 @@ def collect_components(
     for pdep in pipeline_deps:
         if normalize_dep_name(pdep.name) in seen_names:
             continue
-        if is_skipped(pdep.name):
+        if pdep.ecosystem in _NAME_ONLY_ECOSYSTEMS and is_skipped(pdep.name):
             continue
         key = (normalize_dep_name(pdep.name), pdep.version)
         if key in merged:
@@ -142,10 +155,9 @@ def collect_components(
         path, max_depth=max_depth,
     )
     for dep in build_output_deps:
+        # Resolved, installed packages — the skip list never applies.
         key = (normalize_dep_name(dep.name), dep.version)
         if key in merged:
-            continue
-        if is_skipped(dep.name):
             continue
         merged[key] = CheckComponent(
             name=dep.name,
