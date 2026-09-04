@@ -14,17 +14,14 @@ anywhere, instantly, with zero setup.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 from embtrace_check.analyzer.normalize import normalize_dep_name
 from embtrace_check.analyzer.pipeline import run_pipeline
 from embtrace_check.analyzer.scanner import collect_build_files
 from embtrace_check.core.exceptions import CheckCollectionError
 from embtrace_check.payload import CheckComponent, CheckStats
-from embtrace_check.sbom.scanner import scan_directory_recursive
-
-if TYPE_CHECKING:
-    from pathlib import Path
+from embtrace_check.sbom.scanner import _TEST_SCOPE_DIRS, scan_directory_recursive
 
 #: Deterministic pipeline tiers that need no tooling on the host.
 _DEFAULT_TIERS = frozenset({2, 4})
@@ -111,6 +108,7 @@ def collect_components(
                 license=(dep.license or "") if include_declared_metadata else "",
                 purl=(dep.purl or "") if include_declared_metadata else "",
                 cpe=(dep.cpe or "") if include_declared_metadata else "",
+                scope=dep.scope,
             )
             continue
         is_floor = dep.source_kind == "manifest"
@@ -121,6 +119,7 @@ def collect_components(
             source_type="manifest" if is_floor else "lockfile",
             tier=_LOCKFILE_TIER,
             confidence=_MANIFEST_CONFIDENCE if is_floor else _LOCKFILE_CONFIDENCE,
+            scope=dep.scope,
         )
 
     # Path 2: build-file pipeline (deterministic tiers only).
@@ -138,6 +137,12 @@ def collect_components(
         key = (normalize_dep_name(pdep.name), pdep.version)
         if key in merged:
             continue
+        src_parts = Path(pdep.source_file).parts if pdep.source_file else ()
+        pscope = (
+            "excluded"
+            if any(part.lower() in _TEST_SCOPE_DIRS for part in src_parts)
+            else ""
+        )
         merged[key] = CheckComponent(
             name=pdep.name,
             version=pdep.version,
@@ -145,6 +150,7 @@ def collect_components(
             source_type=pdep.detection_method or "build-file",
             tier=pdep.tier,
             confidence=pdep.confidence,
+            scope=pscope,
         )
 
     # Path 3: Yocto/Buildroot BUILD OUTPUT — what is actually in the

@@ -41,6 +41,9 @@ class CheckComponent(BaseModel):
     license: str = ""
     purl: str = ""
     cpe: str = ""
+    #: CycloneDX scope — "excluded" marks test/example material and dev
+    #: tooling: listed, but never gating.
+    scope: str = ""
 
 
 class CheckStats(BaseModel):

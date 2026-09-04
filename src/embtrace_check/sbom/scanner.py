@@ -66,6 +66,10 @@ class Dependency(BaseModel):
     # versions lose against a resolved version of the same package
     # (see prefer_locked) — they are floors, not facts.
     source_kind: str = ""
+    # CycloneDX component.scope ("required" | "optional" | "excluded"),
+    # "" = unknown. "excluded" marks test/example material and dev
+    # tooling — listed, never gating (Befund 10, way (b)).
+    scope: str = ""
     # True only for entries the customer wrote into embtrace-deps.yaml.
     # A declaration is authoritative and is the ONLY class of component
     # whose supplier/license/purl/cpe may travel in the check payload
@@ -583,6 +587,7 @@ def scan_embtrace_deps(path: Path) -> list[Dependency]:
                 description=entry.get("description"),
                 purl=str(entry.get("purl") or "") or _make_purl(ecosystem, name, str(version)),
                 cpe=entry.get("cpe"),
+                scope=str(entry.get("scope") or ""),
                 declared=True,
             ))
 
@@ -1405,6 +1410,13 @@ def prefer_locked(deps: list[Dependency]) -> list[Dependency]:
     return kept
 
 
+#: Test/example directory names — components inside stay listed but
+#: carry scope "excluded" (never gating; Befund 10, way (b)).
+_TEST_SCOPE_DIRS = frozenset({
+    "tests", "test", "examples", "fixtures", "samples", "benchmarks", "docs",
+})
+
+
 def scan_directory_recursive(path: Path, *, max_depth: int = 5) -> list[Dependency]:
     """Recursively scan a directory tree for dependency files.
 
@@ -1433,7 +1445,16 @@ def scan_directory_recursive(path: Path, *, max_depth: int = 5) -> list[Dependen
         seen_dirs.add(resolved)
 
         # Scan this directory
-        all_deps.extend(scan_directory(current, fpga_recursive=False))
+        found = scan_directory(current, fpga_recursive=False)
+        try:
+            rel_parts = current.relative_to(path).parts
+        except ValueError:
+            rel_parts = ()
+        if any(part.lower() in _TEST_SCOPE_DIRS for part in rel_parts):
+            for dep in found:
+                if not dep.scope and not dep.declared:
+                    dep.scope = "excluded"
+        all_deps.extend(found)
 
         if depth >= max_depth:
             return

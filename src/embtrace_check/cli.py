@@ -206,6 +206,13 @@ def _run(  # noqa: PLR0913 — mirrors the CLI surface
             f"vulnerable ones.[/dim]"
         )
 
+    ausgeschlossen = sum(1 for c in components if c.scope == "excluded")
+    if ausgeschlossen:
+        console.print(
+            f"[dim]{ausgeschlossen} component(s) from test/example "
+            f"directories or dev tooling marked scope=excluded — listed, "
+            f"never gating. Adjust via .embtraceignore.[/dim]"
+        )
     declared = sum(1 for c in components if c.source_type == "declared")
     if declared and not no_declared_metadata:
         console.print(
